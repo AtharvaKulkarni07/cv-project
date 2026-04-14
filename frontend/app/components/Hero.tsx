@@ -15,12 +15,12 @@ export default function Hero() {
       </p>
 
       <div className="flex flex-col sm:flex-row items-center gap-6">
-        <button className="bg-white text-black px-8 py-4 rounded-full font-bold text-sm hover:bg-gray-200 transition-colors flex items-center gap-2">
+        <a href="/pipeline" className="bg-white text-black px-8 py-4 rounded-full font-bold text-sm hover:bg-gray-200 transition-colors flex items-center gap-2">
           Start stitching 
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path>
           </svg>
-        </button>
+        </a>
 
       </div>
 
