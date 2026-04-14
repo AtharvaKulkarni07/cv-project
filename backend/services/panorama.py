@@ -103,7 +103,7 @@ def harris_corner_detector(
 def sift_feature_matching(img1: np.ndarray, img2: np.ndarray):
     """
     SIFT detect + BFMatcher with Lowe's ratio test.
-    Returns (src_pts, dst_pts, match_visualisation).
+    Returns (src_pts, dst_pts, match_visualisation, n_good).
     """
     sift = cv2.SIFT_create()
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
@@ -112,10 +112,22 @@ def sift_feature_matching(img1: np.ndarray, img2: np.ndarray):
     kp1, des1 = sift.detectAndCompute(gray1, None)
     kp2, des2 = sift.detectAndCompute(gray2, None)
 
-    # BF kNN match + ratio test
-    bf = cv2.BFMatcher()
+    if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+        raise RuntimeError(
+            "Insufficient keypoints detected. Ensure images have enough "
+            "texture and overlap."
+        )
+
+    # BF kNN match + Lowe's ratio test
+    bf = cv2.BFMatcher(cv2.NORM_L2)
     matches = bf.knnMatch(des1, des2, k=2)
     good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+
+    if len(good) < 4:
+        raise RuntimeError(
+            f"Only {len(good)} good matches found (need >= 4). "
+            "Images may not overlap sufficiently."
+        )
 
     # Visualise
     match_img = cv2.drawMatches(
@@ -131,68 +143,217 @@ def sift_feature_matching(img1: np.ndarray, img2: np.ndarray):
 
 # ── RANSAC Homography ───────────────────────────────────────────────
 
+def _validate_homography(H: np.ndarray) -> bool:
+    """
+    Lightweight sanity-check for a 3×3 homography matrix.
+
+    Only rejects truly catastrophic / degenerate transforms:
+      - Non-finite values
+      - Near-singular matrix (determinant close to zero)
+      - Negative determinant (orientation flip — usually wrong)
+
+    We deliberately keep this lenient because OpenCV's RANSAC with a
+    high inlier ratio is already the best quality signal.  Overly
+    strict checks on perspective coefficients or condition numbers
+    reject valid panorama homographies from real cameras.
+    """
+    if H is None or H.shape != (3, 3):
+        return False
+
+    # Must be finite
+    if not np.isfinite(H).all():
+        return False
+
+    # Normalize so H[2,2] == 1 to make checks meaningful
+    if abs(H[2, 2]) < 1e-8:
+        return False
+    Hn = H / H[2, 2]
+
+    # Check determinant — must be positive (no reflection) and not
+    # near-zero (the original bug had det ≈ 0.001).
+    det = np.linalg.det(Hn)
+    if det < 0.05 or det > 50.0:
+        return False
+
+    # Check that scale components are not wildly off
+    sx = np.sqrt(Hn[0, 0] ** 2 + Hn[1, 0] ** 2)
+    sy = np.sqrt(Hn[0, 1] ** 2 + Hn[1, 1] ** 2)
+    if sx < 0.1 or sx > 10.0 or sy < 0.1 or sy > 10.0:
+        return False
+
+    return True
+
+
 def ransac_homography(
     src_pts: np.ndarray,
     dst_pts: np.ndarray,
-    iterations: int = 2000,
-    threshold: float = 4.0,
-) -> tuple[np.ndarray, int]:
-    """Custom RANSAC loop to find the best homography. Returns (H, inlier_count)."""
-    best_H = None
-    max_inliers = 0
+    threshold: float = 5.0,
+) -> tuple[np.ndarray | None, int]:
+    """
+    Compute a robust homography using OpenCV's built-in RANSAC on ALL
+    matched points.
 
-    for _ in range(iterations):
-        idx = np.random.choice(len(src_pts), 4, replace=False)
-        H, _ = cv2.findHomography(src_pts[idx], dst_pts[idx], cv2.RANSAC, threshold)
-        if H is None:
-            continue
+    The previous implementation ran cv2.findHomography (with RANSAC) on
+    random 4-point subsets in a manual loop — this is redundant and
+    numerically fragile.  OpenCV's internal RANSAC already handles
+    random sampling, inlier counting, and re-estimation.
 
-        transformed = cv2.perspectiveTransform(src_pts, H)
-        dists = np.linalg.norm(transformed - dst_pts, axis=2)
-        inliers = int(np.sum(dists < threshold))
+    Returns (H, inlier_count).
+    """
+    n_pts = len(src_pts)
+    if n_pts < 4:
+        return None, 0
 
-        if inliers > max_inliers:
-            max_inliers = inliers
-            best_H = H
+    # Let OpenCV handle the full RANSAC pipeline on all points
+    H, mask = cv2.findHomography(
+        src_pts, dst_pts,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=threshold,
+        maxIters=5000,
+        confidence=0.999,
+    )
 
-    return best_H, max_inliers
+    if H is None or mask is None:
+        return None, 0
+
+    inlier_count = int(mask.sum())
+    inlier_ratio = inlier_count / n_pts
+
+    # Primary quality gate: inlier ratio.
+    # A good homography should have a substantial fraction of inliers.
+    # If less than 25% of matches are inliers the geometry is suspect.
+    min_inliers = max(8, int(0.25 * n_pts))
+    if inlier_count < min_inliers:
+        return None, 0
+
+    # Secondary gate: catch truly degenerate matrices
+    if not _validate_homography(H):
+        # Fallback: re-estimate with only inlier points using LMEDS
+        inlier_mask = mask.ravel().astype(bool)
+        if inlier_mask.sum() >= 4:
+            H_refined, mask2 = cv2.findHomography(
+                src_pts[inlier_mask],
+                dst_pts[inlier_mask],
+                method=cv2.LMEDS,
+            )
+            if H_refined is not None and _validate_homography(H_refined):
+                H = H_refined
+                inlier_count = int(mask2.sum()) if mask2 is not None else inlier_count
+            else:
+                return None, 0
+        else:
+            return None, 0
+
+    return H, inlier_count
 
 
 # ── Image Stitching (Warp + Composite) ──────────────────────────────
 
 def stitch_images(img1: np.ndarray, img2: np.ndarray, H: np.ndarray) -> np.ndarray:
-    """Warp img1 into img2's frame via H, then composite."""
+    """
+    Warp img1 into img2's frame via H, then composite with linear
+    alpha-blending in overlapping regions to avoid hard seams.
+    """
     h1, w1 = img1.shape[:2]
     h2, w2 = img2.shape[:2]
 
-    # Transform corners of img1
-    pts = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
-    transformed = cv2.perspectiveTransform(pts, H)
+    # Transform corners of img1 to find output canvas bounds
+    corners_img1 = np.float32(
+        [[0, 0], [0, h1], [w1, h1], [w1, 0]]
+    ).reshape(-1, 1, 2)
+    transformed = cv2.perspectiveTransform(corners_img1, H)
 
-    x_min, x_max = int(np.min(transformed[:, 0, 0])), int(np.max(transformed[:, 0, 0]))
-    y_min, y_max = int(np.min(transformed[:, 0, 1])), int(np.max(transformed[:, 0, 1]))
+    # Also include corners of img2 (at their original positions)
+    corners_img2 = np.float32(
+        [[0, 0], [0, h2], [w2, h2], [w2, 0]]
+    ).reshape(-1, 1, 2)
 
+    all_corners = np.concatenate([transformed, corners_img2], axis=0)
+
+    x_min = int(np.floor(np.min(all_corners[:, 0, 0])))
+    x_max = int(np.ceil(np.max(all_corners[:, 0, 0])))
+    y_min = int(np.floor(np.min(all_corners[:, 0, 1])))
+    y_max = int(np.ceil(np.max(all_corners[:, 0, 1])))
+
+    # Translation to shift everything into positive coordinates
     tx = -x_min if x_min < 0 else 0
     ty = -y_min if y_min < 0 else 0
 
-    out_w = max(x_max - x_min, w2 + tx)
-    out_h = max(y_max - y_min, h2 + ty)
+    out_w = x_max - x_min
+    out_h = y_max - y_min
 
-    # Translation matrix so nothing goes negative
+    # Clamp canvas size to prevent memory explosion from bad warps
+    max_dim = max(w1, w2, h1, h2) * 4
+    if out_w > max_dim or out_h > max_dim:
+        raise RuntimeError(
+            f"Output canvas too large ({out_w}×{out_h}). "
+            "Homography may be degenerate."
+        )
+
+    # Translation matrix so nothing goes to negative coordinates
     T = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
-    warped = cv2.warpPerspective(img1, T @ H, (out_w, out_h))
 
-    # Place img2 into canvas
-    y_start, y_end = max(ty, 0), min(ty + h2, out_h)
-    x_start, x_end = max(tx, 0), min(tx + w2, out_w)
-    roi_y1, roi_x1 = max(-ty, 0), max(-tx, 0)
-    roi_y2 = roi_y1 + (y_end - y_start)
-    roi_x2 = roi_x1 + (x_end - x_start)
+    # Warp img1 into the output canvas
+    warped1 = cv2.warpPerspective(img1, T @ H, (out_w, out_h))
 
-    mask = warped[y_start:y_end, x_start:x_end].sum(axis=2) == 0
-    warped[y_start:y_end, x_start:x_end][mask] = img2[roi_y1:roi_y2, roi_x1:roi_x2][mask]
+    # Place img2 into its own canvas at the correct position
+    canvas2 = np.zeros((out_h, out_w, 3), dtype=img2.dtype)
+    y_off, x_off = ty, tx
+    # Compute safe ROI boundaries
+    y1_start = max(y_off, 0)
+    y1_end = min(y_off + h2, out_h)
+    x1_start = max(x_off, 0)
+    x1_end = min(x_off + w2, out_w)
+    # Corresponding region in img2
+    src_y_start = max(-y_off, 0)
+    src_y_end = src_y_start + (y1_end - y1_start)
+    src_x_start = max(-x_off, 0)
+    src_x_end = src_x_start + (x1_end - x1_start)
 
-    return warped
+    canvas2[y1_start:y1_end, x1_start:x1_end] = img2[
+        src_y_start:src_y_end, src_x_start:src_x_end
+    ]
+
+    # Build binary masks for each image
+    mask1 = (warped1.sum(axis=2) > 0).astype(np.float32)
+    mask2 = (canvas2.sum(axis=2) > 0).astype(np.float32)
+
+    # Overlap region
+    overlap = (mask1 * mask2) > 0
+
+    # Compute distance transforms for smooth blending in the overlap
+    # Distance from the edge of each mask → higher weight in the centre
+    dist1 = cv2.distanceTransform((mask1 > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    dist2 = cv2.distanceTransform((mask2 > 0).astype(np.uint8), cv2.DIST_L2, 5)
+
+    # Avoid division by zero
+    sum_dist = dist1 + dist2
+    sum_dist[sum_dist == 0] = 1.0
+
+    # Alpha weight for img1's contribution
+    alpha1 = dist1 / sum_dist
+    alpha2 = dist2 / sum_dist
+
+    # Expand to 3 channels
+    alpha1_3 = np.stack([alpha1] * 3, axis=-1)
+    alpha2_3 = np.stack([alpha2] * 3, axis=-1)
+
+    # Composite: blend in overlap, use original elsewhere
+    result = np.zeros((out_h, out_w, 3), dtype=np.float64)
+
+    # Non-overlap: take whichever image is present
+    only1 = (mask1 > 0) & (~overlap)
+    only2 = (mask2 > 0) & (~overlap)
+    result[only1] = warped1[only1].astype(np.float64)
+    result[only2] = canvas2[only2].astype(np.float64)
+
+    # Overlap: weighted blend
+    result[overlap] = (
+        alpha1_3[overlap] * warped1[overlap].astype(np.float64)
+        + alpha2_3[overlap] * canvas2[overlap].astype(np.float64)
+    )
+
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 # ── Full Pipeline Generator (yields SSE step dicts) ─────────────────
@@ -256,19 +417,23 @@ def run_pipeline(images: list[np.ndarray], session_id: str) -> Generator[StepDic
             "session_id": session_id,
         }
 
-        # Step 3 — RANSAC homography
-        H, inlier_count = ransac_homography(src_pts, dst_pts, threshold=0.5)
+        # Step 3 — RANSAC homography (using robust OpenCV RANSAC)
+        H, inlier_count = ransac_homography(src_pts, dst_pts)
         if H is None:
-            raise RuntimeError(f"Homography estimation failed for pair {i}")
+            raise RuntimeError(
+                f"Homography estimation failed for pair {i}. "
+                f"The computed transform was degenerate or had too few inliers."
+            )
         yield {
             "step": 3,
             "name": "RANSAC Homography",
-            "algorithm": "RANSAC (2000 iters)",
+            "algorithm": "OpenCV RANSAC (5000 iters, 99.9% conf)",
             "description": f"Estimated homography with {inlier_count} inliers.",
             "images": [],
             "metadata": {
                 "inliers": inlier_count,
-                "iterations": 2000,
+                "total_matches": n_good,
+                "inlier_ratio": round(inlier_count / max(n_good, 1), 3),
                 "homography": H.tolist(),
             },
             "session_id": session_id,
@@ -280,7 +445,7 @@ def run_pipeline(images: list[np.ndarray], session_id: str) -> Generator[StepDic
         yield {
             "step": 4,
             "name": "Warping & Stitching",
-            "algorithm": "Perspective Warp",
+            "algorithm": "Perspective Warp + Distance-Weighted Blend",
             "description": f"Stitched pair {i}/{len(images)-1} into panorama.",
             "images": [stitch_url],
             "metadata": {
