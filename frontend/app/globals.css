@@ -1,26 +1,36 @@
+@layer theme, base, clerk, components, utilities;
+
 @import "tailwindcss";
+@plugin "daisyui";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+@font-face {
+  font-family: 'EloquiaDisplay';
+  src: local('EloquiaDisplay-ExtraBold'), url('../public/fonts/EloquiaDisplay-ExtraBold.otf') format('woff2');
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+@font-face {
+  font-family: 'EurotypoBKL';
+  src: local('EurotypoBKL-Italic'), url('../public/fonts/EurotypoBKL-Italic.otf') format('woff2');
+  font-weight: normal;
+  font-style: italic;
+  font-display: swap;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+.font-eloquia {
+  font-family: 'EloquiaDisplay', sans-serif;
+}
+
+.font-eurotypo {
+  font-family: 'EurotypoBKL', serif;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: #050505;
+  color: #ffffff;
+  background-image: radial-gradient(circle at 50% -10%, rgba(234, 88, 12, 0.15) 0%, rgba(5, 5, 5, 1) 50%);
+  background-repeat: no-repeat;
+  background-attachment: fixed;
 }
